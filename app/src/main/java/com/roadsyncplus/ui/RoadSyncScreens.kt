@@ -199,153 +199,157 @@ fun ConnectionScreen(
     } else {
         mtuRequestState.negotiatedMtu
     }
-    Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
-        Text("Connection details", style = MaterialTheme.typography.titleLarge)
-        Text("Selected: ${selectedDevice?.name ?: "No device selected"}")
-        selectedDevice?.let { Text(it.address, fontFamily = FontFamily.Monospace) }
-        Text("Device RSSI: ${selectedDevice?.rssi?.let { "$it dBm" } ?: "N/A"}")
-        Text("Bluetooth adapter: $adapterState")
-        Text("BLE connection: $connectionState")
-        Text("Bonding: $bondingState")
-        Text("Connected device: ${connectedDevice?.name ?: "None"}")
-        Text("Connection started: ${connectionStartedAtMillis?.let(::formatTimestamp) ?: "N/A"}")
-        Text("Connection duration: ${formatDuration(connectionDurationMillis)}")
-        Text("Disconnected: ${disconnectedAtMillis?.let(::formatTimestamp) ?: "N/A"}")
-        Text("Disconnect status: ${disconnectStatus ?: "N/A"}")
-        Text("Service discovery: $serviceDiscoveryState")
-        Text(
-            "Services: ${snapshot.services.size} total, " +
-                "${snapshot.services.count(::isStandardService)} standard, " +
-                "${snapshot.services.count { !isStandardService(it) }} custom",
-        )
-        Text("Negotiated MTU: $displayedMtu")
-        Text("Maximum characteristic write payload: ${(displayedMtu - 3).coerceAtLeast(0)} bytes (no writes are sent)")
-        mtuRequestState.requestedMtu?.let { requested ->
-            Text(
-                "MTU request $requested: ${
-                    when (mtuRequestState.callbackStatus) {
-                        null -> if (mtuRequestState.requestAccepted == true) "waiting for callback" else "not accepted"
-                        0 -> "callback success; negotiated ${mtuRequestState.negotiatedMtu}"
-                        else -> "callback status ${mtuRequestState.callbackStatus}"
+    val queueIdle = operationState.currentOperation == null &&
+        operationState.pendingQueueSize == 0 && !isReadingDiagnostics
+    val readyForRead = connectionState == ConnectionState.CONNECTED &&
+        serviceDiscoveryState == ServiceDiscoveryState.COMPLETE && queueIdle
+    LazyColumn(
+        modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        item {
+            Column(Modifier.fillMaxWidth()) {
+                Text("Connection details", style = MaterialTheme.typography.titleLarge)
+                Text("Selected: ${selectedDevice?.name ?: "No device selected"}")
+                selectedDevice?.let { Text(it.address, fontFamily = FontFamily.Monospace) }
+                Text("Device RSSI: ${selectedDevice?.rssi?.let { "$it dBm" } ?: "N/A"}")
+                Text("Bluetooth adapter: $adapterState")
+                Text("BLE connection: $connectionState")
+                Text("Bonding: $bondingState")
+                Text("Connected device: ${connectedDevice?.name ?: "None"}")
+                Text("Connection started: ${connectionStartedAtMillis?.let(::formatTimestamp) ?: "N/A"}")
+                Text("Connection duration: ${formatDuration(connectionDurationMillis)}")
+                Text("Disconnected: ${disconnectedAtMillis?.let(::formatTimestamp) ?: "N/A"}")
+                Text("Disconnect status: ${disconnectStatus ?: "N/A"}")
+                Text("Service discovery: $serviceDiscoveryState")
+                Text(
+                    "Services: ${snapshot.services.size} total, " +
+                        "${snapshot.services.count(::isStandardService)} standard, " +
+                        "${snapshot.services.count { !isStandardService(it) }} custom",
+                )
+                Text("Negotiated MTU: $displayedMtu")
+                Text("Maximum characteristic write payload: ${(displayedMtu - 3).coerceAtLeast(0)} bytes (no writes are sent)")
+                mtuRequestState.requestedMtu?.let { requested ->
+                    Text(
+                        "MTU request $requested: ${
+                            when (mtuRequestState.callbackStatus) {
+                                null -> if (mtuRequestState.requestAccepted == true) "waiting for callback" else "not accepted"
+                                0 -> "callback success; negotiated ${mtuRequestState.negotiatedMtu}"
+                                else -> "callback status ${mtuRequestState.callbackStatus}"
+                            }
+                        }",
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = onScan) { Text("Scan") }
+                    Button(
+                        onClick = onConnect,
+                        enabled = selectedDevice != null && connectionState == ConnectionState.DISCONNECTED,
+                    ) { Text("Connect") }
+                    OutlinedButton(
+                        onClick = onDisconnect,
+                        enabled = connectionState == ConnectionState.CONNECTED ||
+                            connectionState == ConnectionState.CONNECTING,
+                    ) { Text("Disconnect") }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = onDiscoverServices,
+                        enabled = connectionState == ConnectionState.CONNECTED &&
+                            serviceDiscoveryState != ServiceDiscoveryState.DISCOVERING,
+                    ) {
+                        Text(if (serviceDiscoveryState == ServiceDiscoveryState.DISCOVERING) "Discovering…" else "Discover services")
                     }
-                }",
-            )
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = onScan) { Text("Scan") }
-            Button(
-                onClick = onConnect,
-                enabled = selectedDevice != null && connectionState == ConnectionState.DISCONNECTED,
-            ) { Text("Connect") }
-            OutlinedButton(
-                onClick = onDisconnect,
-                enabled = connectionState == ConnectionState.CONNECTED ||
-                    connectionState == ConnectionState.CONNECTING,
-            ) { Text("Disconnect") }
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(
-                onClick = onDiscoverServices,
-                enabled = connectionState == ConnectionState.CONNECTED &&
-                    serviceDiscoveryState != ServiceDiscoveryState.DISCOVERING,
-            ) {
-                Text(if (serviceDiscoveryState == ServiceDiscoveryState.DISCOVERING) "Discovering…" else "Discover services")
-            }
-            OutlinedButton(
-                onClick = onRequestMtu,
-                enabled = connectionState == ConnectionState.CONNECTED &&
-                    serviceDiscoveryState == ServiceDiscoveryState.COMPLETE &&
-                    operationState.currentOperation == null && operationState.pendingQueueSize == 0,
-            ) {
-                Text("Request MTU 247")
+                    OutlinedButton(
+                        onClick = onRequestMtu,
+                        enabled = connectionState == ConnectionState.CONNECTED &&
+                            serviceDiscoveryState == ServiceDiscoveryState.COMPLETE &&
+                            operationState.currentOperation == null && operationState.pendingQueueSize == 0,
+                    ) {
+                        Text("Request MTU 247")
+                    }
+                }
+                Text("Current GATT operation: ${operationState.currentOperation ?: "Idle"}")
+                Text("Pending queue: ${operationState.pendingQueueSize}")
+                Text("Last successful operation: ${operationState.lastSuccessfulOperation ?: "N/A"}")
+                Text("Last failed operation: ${operationState.lastFailedOperation ?: "N/A"}")
+                Text("Last GATT error code: ${operationState.lastErrorCode ?: "N/A"}")
             }
         }
-        Text("Current GATT operation: ${operationState.currentOperation ?: "Idle"}")
-        Text("Pending queue: ${operationState.pendingQueueSize}")
-        Text("Last successful operation: ${operationState.lastSuccessfulOperation ?: "N/A"}")
-        Text("Last failed operation: ${operationState.lastFailedOperation ?: "N/A"}")
-        Text("Last GATT error code: ${operationState.lastErrorCode ?: "N/A"}")
-        Spacer(Modifier.height(8.dp))
-        val queueIdle = operationState.currentOperation == null &&
-            operationState.pendingQueueSize == 0 && !isReadingDiagnostics
-        val readyForRead = connectionState == ConnectionState.CONNECTED &&
-            serviceDiscoveryState == ServiceDiscoveryState.COMPLETE && queueIdle
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            item {
-                Card(Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(12.dp)) {
-                        Text("Read-only diagnostic tests", style = MaterialTheme.typography.titleMedium)
-                        Text("No reads start automatically. Test 3 requires successful service discovery and MTU negotiation.")
-                        Button(
-                            onClick = { onReadCharacteristic(HondaProtocolReference.MANUFACTURER_NAME_READ_TARGET) },
-                            enabled = readyForRead && mtuRequestState.callbackStatus == 0 &&
-                                !manufacturerReadCompleted,
+        item {
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp)) {
+                    Text("Read-only diagnostic tests", style = MaterialTheme.typography.titleMedium)
+                    Text("No reads start automatically. Test 3 requires successful service discovery and MTU negotiation.")
+                    Button(
+                        onClick = { onReadCharacteristic(HondaProtocolReference.MANUFACTURER_NAME_READ_TARGET) },
+                        enabled = readyForRead && mtuRequestState.callbackStatus == 0 &&
+                            !manufacturerReadCompleted,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(if (manufacturerReadCompleted) "Manufacturer Name test completed" else "Read Manufacturer Name (2A29)")
+                    }
+                    Text("Vehicle Information reads are enabled only after the Manufacturer Name test completes.")
+                    HondaProtocolReference.vehicleInformationReadTargets.forEach { target ->
+                        OutlinedButton(
+                            onClick = { onReadCharacteristic(target) },
+                            enabled = readyForRead && manufacturerReadCompleted,
                             modifier = Modifier.fillMaxWidth(),
                         ) {
-                            Text(if (manufacturerReadCompleted) "Manufacturer Name test completed" else "Read Manufacturer Name (2A29)")
-                        }
-                        Text("Vehicle Information reads are enabled only after the Manufacturer Name test completes.")
-                        HondaProtocolReference.vehicleInformationReadTargets.forEach { target ->
-                            OutlinedButton(
-                                onClick = { onReadCharacteristic(target) },
-                                enabled = readyForRead && manufacturerReadCompleted,
-                                modifier = Modifier.fillMaxWidth(),
-                            ) {
-                                Text("Read ${target.label} (${target.characteristicUuid.take(8)}…)")
-                            }
+                            Text("Read ${target.label} (${target.characteristicUuid.take(8)}…)")
                         }
                     }
                 }
             }
-            if (snapshot.services.isEmpty()) {
-                item { Text("GATT services appear here after explicit service discovery.") }
-            }
-            items(snapshot.services, key = { it.uuid }) { service ->
-                Card(Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(12.dp)) {
-                        Text("Service ${service.uuid}", style = MaterialTheme.typography.titleSmall)
-                        service.characteristics.forEach { characteristic ->
-                            HorizontalDivider(Modifier.padding(vertical = 6.dp))
-                            Text("Characteristic ${characteristic.uuid}", fontFamily = FontFamily.Monospace)
-                            Text("Properties: ${propertyNames(characteristic.properties)}")
-                            Text(
-                                if (characteristic.descriptors.isEmpty()) {
-                                    "Descriptors: none"
-                                } else {
-                                    "Descriptors: ${characteristic.descriptors.joinToString()}"
-                                },
-                            )
-                        }
-                    }
-                }
-            }
-            if (readResults.isNotEmpty()) {
-                item {
-                    Text("Read-only values", style = MaterialTheme.typography.titleMedium)
-                }
-            }
-            items(readResults.asReversed()) { result ->
-                Card(Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(12.dp)) {
+        }
+        if (snapshot.services.isEmpty()) {
+            item { Text("GATT services appear here after explicit service discovery.") }
+        }
+        items(snapshot.services, key = { it.uuid }) { service ->
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp)) {
+                    Text("Service ${service.uuid}", style = MaterialTheme.typography.titleSmall)
+                    service.characteristics.forEach { characteristic ->
+                        HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                        Text("Characteristic ${characteristic.uuid}", fontFamily = FontFamily.Monospace)
+                        Text("Properties: ${propertyNames(characteristic.properties)}")
                         Text(
-                            (HondaProtocolReference.vehicleInformationReadTargets +
-                                HondaProtocolReference.MANUFACTURER_NAME_READ_TARGET).firstOrNull {
-                                it.serviceUuid.equals(result.serviceUuid, ignoreCase = true) &&
-                                    it.characteristicUuid.equals(result.characteristicUuid, ignoreCase = true)
-                            }?.label ?: result.characteristicUuid,
-                            style = MaterialTheme.typography.titleSmall,
+                            if (characteristic.descriptors.isEmpty()) {
+                                "Descriptors: none"
+                            } else {
+                                "Descriptors: ${characteristic.descriptors.joinToString()}"
+                            },
                         )
-                        Text("${result.serviceUuid} / ${result.characteristicUuid}", fontFamily = FontFamily.Monospace)
-                        Text("Read started ${formatTimestamp(result.startedAtMillis)}")
-                        Text("Read completed ${formatTimestamp(result.completedAtMillis)}")
-                        Text("Properties: ${propertyNames(result.properties)}")
-                        Text("GATT status ${result.statusCode ?: "N/A"}")
-                        if (result.value != null) {
-                            Text("Hex: ${formatHex(result.value)}", fontFamily = FontFamily.Monospace)
-                            Text("Decoded: ${decodeCharacteristicValue(result.serviceUuid, result.characteristicUuid, result.value)}")
-                        }
-                        result.error?.let { Text("Error: $it", color = MaterialTheme.colorScheme.error) }
                     }
+                }
+            }
+        }
+        if (readResults.isNotEmpty()) {
+            item {
+                Text("Read-only values", style = MaterialTheme.typography.titleMedium)
+            }
+        }
+        items(readResults.asReversed()) { result ->
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp)) {
+                    Text(
+                        (HondaProtocolReference.vehicleInformationReadTargets +
+                            HondaProtocolReference.MANUFACTURER_NAME_READ_TARGET).firstOrNull {
+                            it.serviceUuid.equals(result.serviceUuid, ignoreCase = true) &&
+                                it.characteristicUuid.equals(result.characteristicUuid, ignoreCase = true)
+                        }?.label ?: result.characteristicUuid,
+                        style = MaterialTheme.typography.titleSmall,
+                    )
+                    Text("${result.serviceUuid} / ${result.characteristicUuid}", fontFamily = FontFamily.Monospace)
+                    Text("Read started ${formatTimestamp(result.startedAtMillis)}")
+                    Text("Read completed ${formatTimestamp(result.completedAtMillis)}")
+                    Text("Properties: ${propertyNames(result.properties)}")
+                    Text("GATT status ${result.statusCode ?: "N/A"}")
+                    if (result.value != null) {
+                        Text("Hex: ${formatHex(result.value)}", fontFamily = FontFamily.Monospace)
+                        Text("Decoded: ${decodeCharacteristicValue(result.serviceUuid, result.characteristicUuid, result.value)}")
+                    }
+                    result.error?.let { Text("Error: $it", color = MaterialTheme.colorScheme.error) }
                 }
             }
         }
