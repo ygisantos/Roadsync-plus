@@ -34,12 +34,17 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.roadsyncplus.ble.CharacteristicKey
+import com.roadsyncplus.ble.CharacteristicReadResult
 import com.roadsyncplus.ble.ConnectionState
 import com.roadsyncplus.ble.DiagnosticEvent
+import com.roadsyncplus.ble.DiagnosticReadTarget
 import com.roadsyncplus.ble.DiscoveredDevice
 import com.roadsyncplus.ble.GattCharacteristicInfo
 import com.roadsyncplus.ble.GattSnapshot
 import com.roadsyncplus.ble.HondaProtocolReference
+import com.roadsyncplus.ble.MtuRequestState
+import com.roadsyncplus.ble.decodeCharacteristicValue
+import com.roadsyncplus.ble.formatHex
 import com.roadsyncplus.ble.propertyNames
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -167,16 +172,38 @@ fun ConnectionScreen(
     connectionState: ConnectionState,
     snapshot: GattSnapshot,
     mtu: Int,
+    mtuRequestState: MtuRequestState,
+    readResults: List<CharacteristicReadResult>,
+    isReadingDiagnostics: Boolean,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
+    onReadDiagnostics: () -> Unit,
+    onRequestMtu: () -> Unit,
 ) {
+    val displayedMtu = if (connectionState == ConnectionState.CONNECTED) {
+        mtu
+    } else {
+        mtuRequestState.negotiatedMtu
+    }
     Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
         Text("Connection details", style = MaterialTheme.typography.titleLarge)
         Text("Selected: ${selectedDevice?.name ?: "No device selected"}")
         selectedDevice?.let { Text(it.address, fontFamily = FontFamily.Monospace) }
         Text("State: $connectionState")
         Text("Connected device: ${connectedDevice?.name ?: "None"}")
-        Text("MTU: $mtu (no MTU request sent by this app)")
+        Text("Negotiated MTU: $displayedMtu")
+        Text("Maximum characteristic write payload: ${(displayedMtu - 3).coerceAtLeast(0)} bytes (no writes are sent)")
+        mtuRequestState.requestedMtu?.let { requested ->
+            Text(
+                "MTU request $requested: ${
+                    when (mtuRequestState.callbackStatus) {
+                        null -> if (mtuRequestState.requestAccepted == true) "waiting for callback" else "not accepted"
+                        0 -> "callback success; negotiated ${mtuRequestState.negotiatedMtu}"
+                        else -> "callback status ${mtuRequestState.callbackStatus}"
+                    }
+                }",
+            )
+        }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
                 onClick = onConnect,
@@ -187,6 +214,22 @@ fun ConnectionScreen(
                 enabled = connectionState == ConnectionState.CONNECTED ||
                     connectionState == ConnectionState.CONNECTING,
             ) { Text("Disconnect") }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = onReadDiagnostics,
+                enabled = connectionState == ConnectionState.CONNECTED &&
+                    snapshot.discovered && !isReadingDiagnostics,
+            ) {
+                Text(if (isReadingDiagnostics) "Reading…" else "Read diagnostic values")
+            }
+            OutlinedButton(
+                onClick = onRequestMtu,
+                enabled = connectionState == ConnectionState.CONNECTED &&
+                    !(mtuRequestState.requestAccepted == true && mtuRequestState.callbackStatus == null),
+            ) {
+                Text("Request MTU 247")
+            }
         }
         Spacer(Modifier.height(8.dp))
         if (snapshot.services.isEmpty()) {
@@ -212,6 +255,31 @@ fun ConnectionScreen(
                     }
                 }
             }
+            if (readResults.isNotEmpty()) {
+                item {
+                    Text("Read-only values", style = MaterialTheme.typography.titleMedium)
+                }
+            }
+            items(readResults.asReversed()) { result ->
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text(
+                            HondaProtocolReference.diagnosticReadTargets.firstOrNull {
+                                it.serviceUuid.equals(result.serviceUuid, ignoreCase = true) &&
+                                    it.characteristicUuid.equals(result.characteristicUuid, ignoreCase = true)
+                            }?.label ?: result.characteristicUuid,
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                        Text("${result.serviceUuid} / ${result.characteristicUuid}", fontFamily = FontFamily.Monospace)
+                        Text("Read at ${formatTimestamp(result.timestampMillis)}; status ${result.statusCode ?: "N/A"}")
+                        if (result.value != null) {
+                            Text("Hex: ${formatHex(result.value)}", fontFamily = FontFamily.Monospace)
+                            Text("Decoded: ${decodeCharacteristicValue(result.serviceUuid, result.characteristicUuid, result.value)}")
+                        }
+                        result.error?.let { Text("Error: $it", color = MaterialTheme.colorScheme.error) }
+                    }
+                }
+            }
         }
     }
 }
@@ -221,15 +289,23 @@ fun NotificationScreen(
     snapshot: GattSnapshot,
     events: List<DiagnosticEvent>,
     enabledNotifications: Set<CharacteristicKey>,
-    onSetNotifications: (String, String, Boolean) -> Unit,
+    onSetNotifications: (String, String, Int, Boolean) -> Unit,
 ) {
     val candidates = snapshot.services.flatMap { service ->
-        service.characteristics.mapNotNull { characteristic ->
-            val supportsNotify =
-                characteristic.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0
-            val supportsIndicate =
-                characteristic.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0
-            if (supportsNotify || supportsIndicate) service.uuid to characteristic else null
+        if (service.uuid.equals(HondaProtocolReference.DFU_SERVICE, ignoreCase = true)) {
+            emptyList()
+        } else {
+            service.characteristics.mapIndexedNotNull { instanceId, characteristic ->
+                val supportsNotify =
+                    characteristic.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0
+                val supportsIndicate =
+                    characteristic.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0
+                if (supportsNotify || supportsIndicate) {
+                    NotificationCandidate(service.uuid, characteristic, instanceId)
+                } else {
+                    null
+                }
+            }
         }
     }
     val notifications = events.filter { it.category == "Notification" }.asReversed()
@@ -239,8 +315,13 @@ fun NotificationScreen(
         Text("Subscriptions write only the standard CCCD descriptor; no characteristic commands are sent.")
         if (candidates.isEmpty()) Text("No Notify/Indicate characteristics discovered.")
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(candidates, key = { it.first + it.second.uuid }) { (serviceUuid, characteristic) ->
-                val key = CharacteristicKey(serviceUuid, characteristic.uuid)
+            items(
+                candidates,
+                key = { "${it.serviceUuid}/${it.characteristic.uuid}/${it.instanceId}" },
+            ) { candidate ->
+                val serviceUuid = candidate.serviceUuid
+                val characteristic = candidate.characteristic
+                val key = CharacteristicKey(serviceUuid, characteristic.uuid, candidate.instanceId)
                 Card(Modifier.fillMaxWidth()) {
                     Row(
                         Modifier.fillMaxWidth().padding(12.dp),
@@ -248,12 +329,15 @@ fun NotificationScreen(
                     ) {
                         Column(Modifier.weight(1f)) {
                             Text(characteristic.uuid, fontFamily = FontFamily.Monospace)
+                            Text("Characteristic instance ${candidate.instanceId + 1}")
                             Text("Service $serviceUuid")
                             Text("Properties: ${propertyNames(characteristic.properties)}")
                         }
                         Switch(
                             checked = key in enabledNotifications,
-                            onCheckedChange = { onSetNotifications(serviceUuid, characteristic.uuid, it) },
+                            onCheckedChange = {
+                                onSetNotifications(serviceUuid, characteristic.uuid, candidate.instanceId, it)
+                            },
                         )
                     }
                 }
@@ -267,6 +351,7 @@ fun NotificationScreen(
                         Text(formatTimestamp(event.timestampMillis))
                         Text("Service ${event.serviceUuid}", fontFamily = FontFamily.Monospace)
                         Text("Characteristic ${event.characteristicUuid}", fontFamily = FontFamily.Monospace)
+                        event.instanceId?.let { Text("Characteristic instance ${it + 1}") }
                         Text(event.payloadHex.orEmpty(), fontFamily = FontFamily.Monospace)
                         TextButton(
                             onClick = {
@@ -281,7 +366,11 @@ fun NotificationScreen(
 }
 
 @Composable
-fun ProtocolScreen(snapshot: GattSnapshot, connectionState: ConnectionState) {
+fun ProtocolScreen(
+    snapshot: GattSnapshot,
+    connectionState: ConnectionState,
+    readResults: List<CharacteristicReadResult>,
+) {
     val knownServices = listOf(
         "Security" to HondaProtocolReference.SECURITY_SERVICE,
         "Data communication" to HondaProtocolReference.DATA_SERVICE,
@@ -296,6 +385,24 @@ fun ProtocolScreen(snapshot: GattSnapshot, connectionState: ConnectionState) {
             HondaProtocolReference.SECURITY_DATA_SOURCE, setOf("Read")),
         KnownCharacteristic("Security.Status", HondaProtocolReference.SECURITY_SERVICE,
             HondaProtocolReference.SECURITY_STATUS, setOf("Read")),
+        KnownCharacteristic("VehicleInfo.VehicleType", HondaProtocolReference.VEHICLE_INFO_SERVICE,
+            HondaProtocolReference.VEHICLE_TYPE, setOf("Read"), expectedValueHex = "01",
+            sourceNote = "UUID observed in supplied PCX160 report; value reference is PCX125 documentation"),
+        KnownCharacteristic("VehicleInfo.DisplayCapability", HondaProtocolReference.VEHICLE_INFO_SERVICE,
+            HondaProtocolReference.DISPLAY_CAPABILITY, setOf("Read"), expectedValueHex = "07",
+            sourceNote = "UUID observed in supplied PCX160 report; value reference is PCX125 documentation"),
+        KnownCharacteristic("VehicleInfo.SwitchType", HondaProtocolReference.VEHICLE_INFO_SERVICE,
+            HondaProtocolReference.SWITCH_TYPE, setOf("Read"), expectedValueHex = "00",
+            sourceNote = "UUID observed in supplied PCX160 report; value reference is PCX125 documentation"),
+        KnownCharacteristic("VehicleInfo.CategoryId", HondaProtocolReference.VEHICLE_INFO_SERVICE,
+            HondaProtocolReference.CATEGORY_ID, setOf("Read"), expectedValueHex = "01",
+            sourceNote = "UUID observed in supplied PCX160 report; value reference is PCX125 documentation"),
+        KnownCharacteristic("VehicleInfo.SeriesCode", HondaProtocolReference.VEHICLE_INFO_SERVICE,
+            HondaProtocolReference.SERIES_CODE, setOf("Read"), expectedValueHex = "AE 05",
+            sourceNote = "UUID observed in supplied PCX160 report; value reference is PCX125 documentation"),
+        KnownCharacteristic("VehicleInfo.DestinationId", HondaProtocolReference.VEHICLE_INFO_SERVICE,
+            HondaProtocolReference.DESTINATION_ID, setOf("Read"), expectedValueHex = "00",
+            sourceNote = "UUID observed in supplied PCX160 report; value reference is PCX125 documentation"),
         KnownCharacteristic("Data.ControlPoint", HondaProtocolReference.DATA_SERVICE,
             HondaProtocolReference.DATA_CONTROL_POINT, setOf("WriteNoResponse", "Notify")),
         KnownCharacteristic("Data.Buttons", HondaProtocolReference.DATA_SERVICE,
@@ -308,7 +415,7 @@ fun ProtocolScreen(snapshot: GattSnapshot, connectionState: ConnectionState) {
 
     Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
         Text("Protocol Explorer", style = MaterialTheme.typography.titleLarge)
-        Text("PCX125 2025 documentation comparison only; PCX160 compatibility is unverified.")
+        Text("PCX125 protocol comparison plus the GATT UUIDs observed in your supplied PCX160 report.")
         if (snapshot.discovered && connectionState != ConnectionState.CONNECTED) {
             Text("Showing the last discovered GATT structure; the device is not currently connected.")
         }
@@ -322,7 +429,14 @@ fun ProtocolScreen(snapshot: GattSnapshot, connectionState: ConnectionState) {
                     Column(Modifier.padding(10.dp)) {
                         Text(label, style = MaterialTheme.typography.titleSmall)
                         Text(uuid, fontFamily = FontFamily.Monospace)
-                        Text(if (present) "Present on connected device" else "Not found / not yet discovered")
+                        Text(
+                            when {
+                                !snapshot.discovered -> "Not found / not yet discovered"
+                                connectionState == ConnectionState.CONNECTED && present -> "Present on connected device"
+                                present -> "Present in last discovery"
+                                else -> "Not found in discovered services"
+                            },
+                        )
                     }
                 }
             }
@@ -335,6 +449,11 @@ fun ProtocolScreen(snapshot: GattSnapshot, connectionState: ConnectionState) {
                     ?.characteristics
                     ?.firstOrNull { it.uuid.equals(known.uuid, ignoreCase = true) }
                 val actualProperties = actual?.let { characteristicPropertySet(it) }
+                val readResult = readResults.lastOrNull {
+                    it.serviceUuid.equals(known.serviceUuid, ignoreCase = true) &&
+                        it.characteristicUuid.equals(known.uuid, ignoreCase = true)
+                }
+                val actualHex = readResult?.value?.let(::formatHex)
                 val comparison = when {
                     !snapshot.discovered -> "Connect and discover services to compare"
                     known.documentedAbsent && actual == null -> "Matches documentation: absent on PCX125"
@@ -349,6 +468,7 @@ fun ProtocolScreen(snapshot: GattSnapshot, connectionState: ConnectionState) {
                         Text(known.uuid, fontFamily = FontFamily.Monospace)
                         Text("Actual: ${actual?.let { propertyNames(it.properties) } ?: "Not found"}")
                         Text("Expected: ${if (known.documentedAbsent) "not present" else known.expectedProperties.joinToString()}")
+                        known.sourceNote?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
                         Text(
                             "Notifications: ${
                                 when {
@@ -360,12 +480,35 @@ fun ProtocolScreen(snapshot: GattSnapshot, connectionState: ConnectionState) {
                             }",
                         )
                         Text(comparison)
+                        if (known.expectedValueHex != null) {
+                            Text("PCX125 reference value: ${known.expectedValueHex}")
+                            Text("Actual read: ${actualHex ?: readResult?.error ?: "Not read"}")
+                            if (actualHex != null) {
+                                Text(
+                                    if (actualHex.replace(" ", "").equals(
+                                            known.expectedValueHex.replace(" ", ""),
+                                            ignoreCase = true,
+                                        )
+                                    ) {
+                                        "Value matches the PCX125 reference"
+                                    } else {
+                                        "Value differs from the PCX125 reference"
+                                    },
+                                )
+                            }
+                        }
+                        if (known.uuid == HondaProtocolReference.SECURITY_STATUS) {
+                            val decodedStatus = readResult?.value?.let {
+                                decodeCharacteristicValue(known.serviceUuid, known.uuid, it)
+                            }
+                            Text("Last read: ${decodedStatus ?: readResult?.error ?: "Not read"}")
+                        }
                     }
                 }
             }
             item {
                 Text(
-                    "Vehicle-information characteristic UUIDs are abbreviated in the reference document and are not guessed here.",
+                    "The six full Vehicle Information UUIDs above were taken from your supplied PCX160 report; the ScooterLink document abbreviates them. Only PCX125 reference values are compared.",
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
@@ -379,6 +522,14 @@ private data class KnownCharacteristic(
     val uuid: String,
     val expectedProperties: Set<String>,
     val documentedAbsent: Boolean = false,
+    val expectedValueHex: String? = null,
+    val sourceNote: String? = null,
+)
+
+private data class NotificationCandidate(
+    val serviceUuid: String,
+    val characteristic: GattCharacteristicInfo,
+    val instanceId: Int,
 )
 
 private fun characteristicPropertySet(characteristic: GattCharacteristicInfo): Set<String> =

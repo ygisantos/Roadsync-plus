@@ -34,8 +34,8 @@ class AndroidBleRepository(context: Context) : BleRepository {
 
     private val connectionManager = BleConnectionManager(
         context = appContext,
-        onEvent = { category, message, serviceUuid, characteristicUuid, payloadHex ->
-            appendEvent(category, message, serviceUuid, characteristicUuid, payloadHex)
+        onEvent = { category, message, serviceUuid, characteristicUuid, payloadHex, instanceId ->
+            appendEvent(category, message, serviceUuid, characteristicUuid, payloadHex, instanceId)
         },
         onFailure = { message, serviceUuid, characteristicUuid ->
             reportFailure(message, serviceUuid, characteristicUuid)
@@ -46,8 +46,12 @@ class AndroidBleRepository(context: Context) : BleRepository {
     override val connectedDevice: StateFlow<DiscoveredDevice?> = connectionManager.connectedDevice
     override val gattSnapshot: StateFlow<GattSnapshot> = connectionManager.gattSnapshot
     override val mtu: StateFlow<Int> = connectionManager.mtu
+    override val mtuRequestState: StateFlow<MtuRequestState> = connectionManager.mtuRequestState
     override val enabledNotifications: StateFlow<Set<CharacteristicKey>> =
         connectionManager.enabledNotifications
+    override val characteristicReadResults: StateFlow<List<CharacteristicReadResult>> =
+        connectionManager.characteristicReadResults
+    override val isReadingDiagnostics: StateFlow<Boolean> = connectionManager.isReadingDiagnostics
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
@@ -115,9 +119,18 @@ class AndroidBleRepository(context: Context) : BleRepository {
     override fun setNotifications(
         serviceUuid: String,
         characteristicUuid: String,
+        instanceId: Int,
         enabled: Boolean,
     ) {
-        connectionManager.setNotifications(serviceUuid, characteristicUuid, enabled)
+        connectionManager.setNotifications(serviceUuid, characteristicUuid, instanceId, enabled)
+    }
+
+    override fun readDiagnosticCharacteristics() {
+        connectionManager.readDiagnosticCharacteristics()
+    }
+
+    override fun requestMtu() {
+        connectionManager.requestMtu()
     }
 
     override fun clearStatusMessage() {
@@ -152,7 +165,19 @@ class AndroidBleRepository(context: Context) : BleRepository {
                 }",
             )
             appendLine("Connection state: ${connectionManager.connectionState.value}")
-            appendLine("MTU: ${connectionManager.mtu.value}")
+            val mtuState = connectionManager.mtuRequestState.value
+            appendLine("MTU requested: ${mtuState.requestedMtu ?: "none"}")
+            appendLine("MTU request accepted: ${mtuState.requestAccepted ?: "N/A"}")
+            appendLine("MTU callback status: ${mtuState.callbackStatus ?: "not received"}")
+            appendLine("MTU: ${mtuState.negotiatedMtu}")
+            mtuState.requestedAtMillis?.let {
+                appendLine("MTU request timestamp: ${dateFormat.format(Date(it))}")
+            }
+            mtuState.callbackAtMillis?.let {
+                appendLine("MTU callback timestamp: ${dateFormat.format(Date(it))}")
+            }
+            appendLine("Maximum characteristic write payload: ${(mtuState.negotiatedMtu - 3).coerceAtLeast(0)} bytes")
+            appendLine("Diagnostic reads in progress: ${connectionManager.isReadingDiagnostics.value}")
             appendLine(
                 "GATT discovery: ${
                     if (connectionManager.gattSnapshot.value.discovered) "available (last successful discovery)"
@@ -165,12 +190,45 @@ class AndroidBleRepository(context: Context) : BleRepository {
                 appendLine("  Service ${service.uuid}")
                 service.characteristics.forEach { characteristic ->
                     appendLine(
-                        "    Characteristic ${characteristic.uuid}; properties=${propertyNames(characteristic.properties)}",
+                        "    Characteristic ${characteristic.uuid}; instance=${characteristic.instanceId}; properties=${propertyNames(characteristic.properties)}",
                     )
                     characteristic.descriptors.forEach { descriptor ->
                         appendLine("      Descriptor $descriptor")
                     }
                 }
+            }
+            appendLine()
+            appendLine("Read-only characteristic results:")
+            connectionManager.characteristicReadResults.value.forEach { result ->
+                val target = HondaProtocolReference.diagnosticReadTargets.firstOrNull {
+                    it.serviceUuid.equals(result.serviceUuid, ignoreCase = true) &&
+                        it.characteristicUuid.equals(result.characteristicUuid, ignoreCase = true)
+                }
+                appendLine(
+                    "${dateFormat.format(Date(result.timestampMillis))} ${target?.label ?: "Characteristic"} " +
+                        "${result.serviceUuid}/${result.characteristicUuid} " +
+                        "status=${result.statusCode ?: "N/A"}",
+                )
+                if (result.value != null) {
+                    val actualHex = formatHex(result.value)
+                    appendLine("  Hex: $actualHex")
+                    appendLine(
+                        "  Decoded: ${decodeCharacteristicValue(result.serviceUuid, result.characteristicUuid, result.value)}",
+                    )
+                    target?.pcx125ValueHex?.let { referenceValue ->
+                        appendLine("  PCX125 reference: $referenceValue")
+                        appendLine(
+                            "  Reference comparison: ${
+                                if (actualHex.replace(" ", "").equals(
+                                        referenceValue.replace(" ", ""),
+                                        ignoreCase = true,
+                                    )
+                                ) "match" else "different"
+                            }",
+                        )
+                    }
+                }
+                result.error?.let { appendLine("  Error: $it") }
             }
             appendLine()
             appendLine("Diagnostic events:")
@@ -179,6 +237,7 @@ class AndroidBleRepository(context: Context) : BleRepository {
                 append(" [${event.category}] ${event.message}")
                 event.serviceUuid?.let { append(" service=$it") }
                 event.characteristicUuid?.let { append(" characteristic=$it") }
+                event.instanceId?.let { append(" instance=$it") }
                 event.payloadHex?.let { append(" payload=$it") }
                 appendLine()
             }
@@ -196,14 +255,16 @@ class AndroidBleRepository(context: Context) : BleRepository {
         serviceUuid: String? = null,
         characteristicUuid: String? = null,
         payloadHex: String? = null,
+        instanceId: Int? = null,
     ) {
         _events.value = _events.value + DiagnosticEvent(
-            System.currentTimeMillis(),
-            category,
-            message,
-            serviceUuid,
-            characteristicUuid,
-            payloadHex,
+            timestampMillis = System.currentTimeMillis(),
+            category = category,
+            message = message,
+            serviceUuid = serviceUuid,
+            characteristicUuid = characteristicUuid,
+            payloadHex = payloadHex,
+            instanceId = instanceId,
         )
     }
 

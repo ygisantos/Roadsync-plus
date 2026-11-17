@@ -77,8 +77,11 @@ private fun RoadSyncApp(
     val connectedDevice by repository.connectedDevice.collectAsStateWithLifecycle()
     val gattSnapshot by repository.gattSnapshot.collectAsStateWithLifecycle()
     val mtu by repository.mtu.collectAsStateWithLifecycle()
+    val mtuRequestState by repository.mtuRequestState.collectAsStateWithLifecycle()
     val events by repository.events.collectAsStateWithLifecycle()
     val enabledNotifications by repository.enabledNotifications.collectAsStateWithLifecycle()
+    val characteristicReadResults by repository.characteristicReadResults.collectAsStateWithLifecycle()
+    val isReadingDiagnostics by repository.isReadingDiagnostics.collectAsStateWithLifecycle()
     val statusMessage by repository.statusMessage.collectAsStateWithLifecycle()
 
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -140,8 +143,13 @@ private fun RoadSyncApp(
                 connectionState = connectionState,
                 snapshot = gattSnapshot,
                 mtu = mtu,
+                mtuRequestState = mtuRequestState,
+                readResults = characteristicReadResults,
+                isReadingDiagnostics = isReadingDiagnostics,
                 onConnect = { selectedDevice?.let(repository::connect) },
                 onDisconnect = repository::disconnect,
+                onReadDiagnostics = repository::readDiagnosticCharacteristics,
+                onRequestMtu = repository::requestMtu,
             )
         },
         monitor = {
@@ -153,7 +161,11 @@ private fun RoadSyncApp(
             )
         },
         protocol = {
-            ProtocolScreen(snapshot = gattSnapshot, connectionState = connectionState)
+            ProtocolScreen(
+                snapshot = gattSnapshot,
+                connectionState = connectionState,
+                readResults = characteristicReadResults,
+            )
         },
     )
 }

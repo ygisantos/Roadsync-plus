@@ -11,6 +11,7 @@ import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothStatusCodes
 import android.content.Context
 import android.os.Build
+import java.util.ArrayDeque
 import java.util.Locale
 import java.util.UUID
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -25,6 +26,7 @@ class BleConnectionManager(
         serviceUuid: String?,
         characteristicUuid: String?,
         payloadHex: String?,
+        instanceId: Int?,
     ) -> Unit,
     private val onFailure: (
         message: String,
@@ -44,14 +46,24 @@ class BleConnectionManager(
     val gattSnapshot: StateFlow<GattSnapshot> = _gattSnapshot.asStateFlow()
     private val _mtu = MutableStateFlow(23)
     val mtu: StateFlow<Int> = _mtu.asStateFlow()
+    private val _mtuRequestState = MutableStateFlow(MtuRequestState())
+    val mtuRequestState: StateFlow<MtuRequestState> = _mtuRequestState.asStateFlow()
     private val _enabledNotifications = MutableStateFlow<Set<CharacteristicKey>>(emptySet())
     val enabledNotifications: StateFlow<Set<CharacteristicKey>> =
         _enabledNotifications.asStateFlow()
+    private val _characteristicReadResults = MutableStateFlow<List<CharacteristicReadResult>>(emptyList())
+    val characteristicReadResults: StateFlow<List<CharacteristicReadResult>> =
+        _characteristicReadResults.asStateFlow()
+    private val _isReadingDiagnostics = MutableStateFlow(false)
+    val isReadingDiagnostics: StateFlow<Boolean> = _isReadingDiagnostics.asStateFlow()
 
     private var gatt: BluetoothGatt? = null
     private var lastDevice: DiscoveredDevice? = null
     private var pendingDescriptorKey: CharacteristicKey? = null
     private var pendingDescriptorEnable: Boolean? = null
+    private val readQueue = ArrayDeque<DiagnosticReadTarget>()
+    private var pendingReadKey: CharacteristicKey? = null
+    private var pendingReadTarget: DiagnosticReadTarget? = null
 
     val reportDevice: DiscoveredDevice?
         get() = _connectedDevice.value ?: lastDevice
@@ -81,11 +93,25 @@ class BleConnectionManager(
                     onError("Service discovery permission denied: ${exception.message}")
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                pendingReadTarget?.let {
+                    recordReadFailure(it, "Disconnected before characteristic read completed")
+                }
+                pendingReadTarget = null
+                while (readQueue.isNotEmpty()) {
+                    recordReadFailure(
+                        readQueue.removeFirst(),
+                        "Disconnected before characteristic read started",
+                    )
+                }
                 _connectedDevice.value = null
                 _enabledNotifications.value = emptySet()
                 _mtu.value = 23
                 pendingDescriptorKey = null
                 pendingDescriptorEnable = null
+                readQueue.clear()
+                pendingReadKey = null
+                pendingReadTarget = null
+                _isReadingDiagnostics.value = false
                 if (this@BleConnectionManager.gatt === gatt) {
                     this@BleConnectionManager.gatt = null
                 }
@@ -105,13 +131,14 @@ class BleConnectionManager(
             val discovered = gatt.services.map { service ->
                 GattServiceInfo(
                     uuid = service.uuid.toString().uppercase(Locale.ROOT),
-                    characteristics = service.characteristics.map { characteristic ->
+                    characteristics = service.characteristics.mapIndexed { instanceId, characteristic ->
                         GattCharacteristicInfo(
                             uuid = characteristic.uuid.toString().uppercase(Locale.ROOT),
                             properties = characteristic.properties,
                             descriptors = characteristic.descriptors.map {
                                 it.uuid.toString().uppercase(Locale.ROOT)
                             },
+                            instanceId = instanceId,
                         )
                     },
                 )
@@ -121,12 +148,18 @@ class BleConnectionManager(
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
+            val succeeded = status == BluetoothGatt.GATT_SUCCESS
+            if (succeeded) {
                 _mtu.value = mtu
-                recordEvent("Connection", "MTU changed to $mtu")
             } else {
                 onError("MTU update failed (GATT status $status)")
             }
+            _mtuRequestState.value = _mtuRequestState.value.copy(
+                negotiatedMtu = if (succeeded) mtu else _mtu.value,
+                callbackStatus = status,
+                callbackAtMillis = System.currentTimeMillis(),
+            )
+            recordEvent("Connection", "MTU callback: mtu=$mtu status=$status")
         }
 
         override fun onDescriptorWrite(
@@ -154,7 +187,9 @@ class BleConnectionManager(
                 )
             } else {
                 val characteristic = gatt.getService(UUID.fromString(key.serviceUuid))
-                    ?.getCharacteristic(UUID.fromString(key.characteristicUuid))
+                    ?.characteristics
+                    ?.getOrNull(key.instanceId)
+                    ?.takeIf { it.uuid.toString().equals(key.characteristicUuid, ignoreCase = true) }
                 if (characteristic != null) {
                     restoreLocalNotification(gatt, characteristic, !enabled)
                 }
@@ -176,6 +211,24 @@ class BleConnectionManager(
             value: ByteArray,
         ) {
             recordNotification(characteristic, value)
+        }
+
+        @Suppress("DEPRECATION")
+        override fun onCharacteristicRead(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int,
+        ) {
+            completeRead(gatt, characteristic, characteristic.value ?: byteArrayOf(), status)
+        }
+
+        override fun onCharacteristicRead(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray,
+            status: Int,
+        ) {
+            completeRead(gatt, characteristic, value, status)
         }
     }
 
@@ -202,6 +255,12 @@ class BleConnectionManager(
         _connectionState.value = ConnectionState.CONNECTING
         _gattSnapshot.value = GattSnapshot()
         _mtu.value = 23
+        _mtuRequestState.value = MtuRequestState()
+        _isReadingDiagnostics.value = false
+        _characteristicReadResults.value = emptyList()
+        readQueue.clear()
+        pendingReadKey = null
+        pendingReadTarget = null
         recordEvent("Connection", "Connecting to ${device.name ?: "unnamed device"} (${device.address})")
         try {
             val newGatt = bluetoothDevice.connectGatt(
@@ -243,18 +302,36 @@ class BleConnectionManager(
         }
     }
 
-    fun setNotifications(serviceUuid: String, characteristicUuid: String, enabled: Boolean) {
+    fun setNotifications(
+        serviceUuid: String,
+        characteristicUuid: String,
+        instanceId: Int,
+        enabled: Boolean,
+    ) {
+        if (serviceUuid.equals(HondaProtocolReference.DFU_SERVICE, ignoreCase = true)) {
+            onError("Notification subscriptions are disabled for the DFU service")
+            return
+        }
         val currentGatt = gatt
         val serviceId = parseUuid(serviceUuid) ?: return
         val characteristicId = parseUuid(characteristicUuid) ?: return
-        val key = CharacteristicKey(serviceUuid.uppercase(Locale.ROOT), characteristicUuid.uppercase(Locale.ROOT))
-        if (pendingDescriptorKey != null) {
-            onError("Wait for the current notification subscription to finish")
+        val key = CharacteristicKey(
+            serviceUuid.uppercase(Locale.ROOT),
+            characteristicUuid.uppercase(Locale.ROOT),
+            instanceId,
+        )
+        if (pendingDescriptorKey != null || pendingReadKey != null ||
+            (_mtuRequestState.value.requestAccepted == true &&
+                _mtuRequestState.value.callbackStatus == null)
+        ) {
+            onError("Wait for the current GATT operation to finish")
             return
         }
         val characteristic = currentGatt
             ?.getService(serviceId)
-            ?.getCharacteristic(characteristicId)
+            ?.characteristics
+            ?.getOrNull(instanceId)
+            ?.takeIf { it.uuid == characteristicId }
         if (currentGatt == null || characteristic == null) {
             onError("Characteristic is no longer available")
             return
@@ -321,6 +398,61 @@ class BleConnectionManager(
         }
     }
 
+    fun readDiagnosticCharacteristics() {
+        val currentGatt = gatt
+        if (currentGatt == null || _connectionState.value != ConnectionState.CONNECTED) {
+            onError("Connect to a device before reading diagnostic characteristics")
+            return
+        }
+        if (!_gattSnapshot.value.discovered) {
+            onError("Wait for GATT discovery to finish before reading characteristics")
+            return
+        }
+        if (pendingDescriptorKey != null || pendingReadKey != null || readQueue.isNotEmpty() ||
+            (_mtuRequestState.value.requestAccepted == true &&
+                _mtuRequestState.value.callbackStatus == null)
+        ) {
+            onError("A GATT operation is already in progress")
+            return
+        }
+        readQueue.addAll(HondaProtocolReference.diagnosticReadTargets)
+        _isReadingDiagnostics.value = true
+        processNextRead()
+    }
+
+    fun requestMtu() {
+        val currentGatt = gatt
+        if (currentGatt == null || _connectionState.value != ConnectionState.CONNECTED) {
+            onError("Connect to a device before requesting an MTU")
+            return
+        }
+        if (pendingDescriptorKey != null || pendingReadKey != null || readQueue.isNotEmpty() ||
+            (_mtuRequestState.value.requestAccepted == true &&
+                _mtuRequestState.value.callbackStatus == null)
+        ) {
+            onError("Wait for the current GATT operation to finish before requesting an MTU")
+            return
+        }
+        val timestamp = System.currentTimeMillis()
+        _mtuRequestState.value = MtuRequestState(
+            requestedMtu = REQUESTED_MTU,
+            negotiatedMtu = _mtu.value,
+            requestedAtMillis = timestamp,
+        )
+        try {
+            val accepted = currentGatt.requestMtu(REQUESTED_MTU)
+            _mtuRequestState.value = _mtuRequestState.value.copy(requestAccepted = accepted)
+            recordEvent(
+                "Connection",
+                "MTU request $REQUESTED_MTU ${if (accepted) "accepted" else "rejected"}",
+            )
+            if (!accepted) onError("Android did not accept the MTU request")
+        } catch (exception: SecurityException) {
+            _mtuRequestState.value = _mtuRequestState.value.copy(requestAccepted = false)
+            onError("Bluetooth connect permission denied while requesting MTU: ${exception.message}")
+        }
+    }
+
     fun close() {
         gatt?.let { currentGatt ->
             try {
@@ -340,11 +472,16 @@ class BleConnectionManager(
         _enabledNotifications.value = emptySet()
         pendingDescriptorKey = null
         pendingDescriptorEnable = null
+        readQueue.clear()
+        pendingReadKey = null
+        pendingReadTarget = null
+        _isReadingDiagnostics.value = false
     }
 
     private fun recordNotification(characteristic: BluetoothGattCharacteristic, value: ByteArray) {
         val serviceUuid = characteristic.service.uuid.toString().uppercase(Locale.ROOT)
         val characteristicUuid = characteristic.uuid.toString().uppercase(Locale.ROOT)
+        val instanceId = characteristic.service.characteristics.indexOfFirst { it === characteristic }
         val payload = value.joinToString(" ") { "%02X".format(it) }
         recordEvent(
             "Notification",
@@ -352,7 +489,109 @@ class BleConnectionManager(
             serviceUuid,
             characteristicUuid,
             payload,
+            instanceId,
         )
+    }
+
+    private fun processNextRead() {
+        val currentGatt = gatt ?: run {
+            _isReadingDiagnostics.value = false
+            readQueue.clear()
+            return
+        }
+        while (readQueue.isNotEmpty()) {
+            val target = readQueue.removeFirst()
+            val service = currentGatt.getService(UUID.fromString(target.serviceUuid))
+            val characteristic = service?.characteristics
+                ?.firstOrNull { it.uuid.toString().equals(target.characteristicUuid, ignoreCase = true) }
+            if (characteristic == null) {
+                recordReadFailure(target, "Characteristic not present on connected device")
+                continue
+            }
+            if (characteristic.properties and BluetoothGattCharacteristic.PROPERTY_READ == 0) {
+                recordReadFailure(target, "Characteristic does not support Read")
+                continue
+            }
+
+            val instanceId = service.characteristics.indexOfFirst { it === characteristic }
+            pendingReadKey = CharacteristicKey(target.serviceUuid, target.characteristicUuid, instanceId)
+            pendingReadTarget = target
+            val queued = try {
+                @Suppress("DEPRECATION")
+                currentGatt.readCharacteristic(characteristic)
+            } catch (exception: SecurityException) {
+                pendingReadKey = null
+                pendingReadTarget = null
+                recordReadFailure(target, "Bluetooth read permission denied: ${exception.message}")
+                continue
+            }
+            if (queued) return
+
+            pendingReadKey = null
+            pendingReadTarget = null
+            recordReadFailure(target, "Android could not queue the characteristic read")
+        }
+        _isReadingDiagnostics.value = false
+    }
+
+    private fun completeRead(
+        callbackGatt: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic,
+        value: ByteArray,
+        status: Int,
+    ) {
+        if (callbackGatt !== gatt) return
+        val target = pendingReadTarget ?: return
+        val key = pendingReadKey ?: return
+        val serviceUuid = characteristic.service.uuid.toString().uppercase(Locale.ROOT)
+        val characteristicUuid = characteristic.uuid.toString().uppercase(Locale.ROOT)
+        val instanceId = characteristic.service.characteristics.indexOfFirst { it === characteristic }
+        if (key.serviceUuid != serviceUuid ||
+            key.characteristicUuid != characteristicUuid ||
+            key.instanceId != instanceId
+        ) {
+            return
+        }
+        pendingReadKey = null
+        pendingReadTarget = null
+        if (status == BluetoothGatt.GATT_SUCCESS) {
+            val bytes = value.map { it.toInt() and 0xFF }
+            val result = CharacteristicReadResult(
+                timestampMillis = System.currentTimeMillis(),
+                serviceUuid = serviceUuid,
+                characteristicUuid = characteristicUuid,
+                value = bytes,
+                statusCode = status,
+            )
+            _characteristicReadResults.value = _characteristicReadResults.value + result
+            recordEvent(
+                "Read",
+                "${target.label}: ${decodeCharacteristicValue(serviceUuid, characteristicUuid, bytes)}",
+                serviceUuid,
+                characteristicUuid,
+                formatHex(bytes),
+                instanceId,
+            )
+        } else {
+            recordReadFailure(target, "Characteristic read failed (GATT status $status)", status)
+        }
+        processNextRead()
+    }
+
+    private fun recordReadFailure(
+        target: DiagnosticReadTarget,
+        message: String,
+        statusCode: Int? = null,
+    ) {
+        _characteristicReadResults.value = _characteristicReadResults.value + CharacteristicReadResult(
+            timestampMillis = System.currentTimeMillis(),
+            serviceUuid = target.serviceUuid,
+            characteristicUuid = target.characteristicUuid,
+            value = null,
+            statusCode = statusCode,
+            error = message,
+        )
+        onError(message, target.serviceUuid, target.characteristicUuid)
     }
 
     private fun recordEvent(
@@ -361,8 +600,9 @@ class BleConnectionManager(
         serviceUuid: String? = null,
         characteristicUuid: String? = null,
         payloadHex: String? = null,
+        instanceId: Int? = null,
     ) {
-        onEvent(category, message, serviceUuid, characteristicUuid, payloadHex)
+        onEvent(category, message, serviceUuid, characteristicUuid, payloadHex, instanceId)
     }
 
     private fun restoreLocalNotification(
@@ -394,6 +634,7 @@ class BleConnectionManager(
     }
 
     companion object {
+        private const val REQUESTED_MTU = 247
         private val CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     }
 }

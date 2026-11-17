@@ -6,7 +6,7 @@ RoadSync Plus is an Android BLE research prototype for inspecting the Honda PCX1
 
 - The app does not implement Honda authentication, key exchange, registration, commands, pairing management, or characteristic writes.
 - Notification toggles only write the standard Client Characteristic Configuration Descriptor (CCCD) to enable or disable subscription.
-- No DFU characteristic is exposed for interaction. Do not write to the DFU service.
+- DFU is excluded from notification subscription and characteristic reads. Its discovered metadata is displayed only; do not interact with or write to the DFU service.
 - Do not use this app to experiment with screen drawing or unverified registration commands.
 - ScooterLink documents a PCX125 2025, not a PCX160. Its UUIDs and expected properties in Protocol Explorer are comparison references only; this project makes no compatibility claim.
 
@@ -17,7 +17,8 @@ RoadSync Plus is an Android BLE research prototype for inspecting the Honda PCX1
 - Connection-state, MTU, characteristic-property, and timestamped notification monitoring.
 - Individual notification payload copying.
 - Export as a plain-text report through Android's document picker.
-- Protocol Explorer compares only fully published UUIDs. The source protocol abbreviates its Vehicle Information characteristic UUIDs, so they are intentionally not guessed or shown as known characteristics.
+- Protocol Explorer compares documented UUIDs plus the six Vehicle Information characteristic UUIDs observed in the supplied PCX160 report. ScooterLink abbreviates those UUIDs and its documented values remain PCX125 references.
+- Connection Details can explicitly read the Vehicle Information values, Security.Status, readable Device Information characteristics, and Battery Level, and can explicitly request MTU 247.
 
 ## Build
 
@@ -35,10 +36,11 @@ Grant Nearby Devices permissions when prompted. On Android versions before 12, l
 2. Scan for `HONDA BTU` or enable **Show all BLE devices**.
 3. Select a device and connect. Discovery is automatic.
 4. Inspect the discovered GATT tree and Protocol Explorer comparisons.
-5. In Notification Monitor, explicitly enable notifications only for characteristics advertising Notify or Indicate.
-6. Export a report from the top-bar action.
+5. In Connection Details, tap **Read diagnostic values** to read the supported values sequentially, or explicitly tap **Request MTU 247**.
+6. In Notification Monitor, explicitly enable notifications only for characteristics advertising Notify or Indicate.
+7. Export a report from the top-bar action.
 
-The app does not automatically pair, authenticate, modify registrations, or send application data. Whether Android displays a system pairing prompt depends on the peripheral and Android platform behavior; the app itself does not initiate pairing.
+The app does not automatically pair, authenticate, modify registrations, or send application data. Characteristic reads and MTU negotiation occur only after a user action. The app does not send characteristic writes; notification toggles write only the standard CCCD descriptor. Whether Android displays a system pairing prompt depends on the peripheral and Android platform behavior; the app itself does not initiate pairing.
 
 ## Protocol reference
 
