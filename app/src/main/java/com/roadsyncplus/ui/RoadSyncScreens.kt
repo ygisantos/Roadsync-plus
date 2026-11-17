@@ -35,14 +35,17 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.roadsyncplus.ble.CharacteristicKey
 import com.roadsyncplus.ble.CharacteristicReadResult
+import com.roadsyncplus.ble.BondingState
 import com.roadsyncplus.ble.ConnectionState
 import com.roadsyncplus.ble.DiagnosticEvent
 import com.roadsyncplus.ble.DiagnosticReadTarget
 import com.roadsyncplus.ble.DiscoveredDevice
+import com.roadsyncplus.ble.GattOperationState
 import com.roadsyncplus.ble.GattCharacteristicInfo
 import com.roadsyncplus.ble.GattSnapshot
 import com.roadsyncplus.ble.HondaProtocolReference
 import com.roadsyncplus.ble.MtuRequestState
+import com.roadsyncplus.ble.ServiceDiscoveryState
 import com.roadsyncplus.ble.decodeCharacteristicValue
 import com.roadsyncplus.ble.formatHex
 import com.roadsyncplus.ble.propertyNames
@@ -134,7 +137,7 @@ fun ScannerScreen(
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(onClick = if (isScanning) onStopScan else onScan) {
-                Text(if (isScanning) "Stop scan" else "Scan")
+                Text(if (isScanning) "Stop scan" else "Scan for motorcycle")
             }
             if (isScanning) Text("Scanning (15 second limit)…", Modifier.align(Alignment.CenterVertically))
         }
@@ -173,11 +176,22 @@ fun ConnectionScreen(
     snapshot: GattSnapshot,
     mtu: Int,
     mtuRequestState: MtuRequestState,
+    serviceDiscoveryState: ServiceDiscoveryState,
+    operationState: GattOperationState,
+    adapterState: String,
+    bondingState: BondingState,
+    connectionStartedAtMillis: Long?,
+    disconnectedAtMillis: Long?,
+    disconnectStatus: Int?,
+    connectionDurationMillis: Long,
     readResults: List<CharacteristicReadResult>,
     isReadingDiagnostics: Boolean,
+    manufacturerReadCompleted: Boolean,
+    onScan: () -> Unit,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
-    onReadDiagnostics: () -> Unit,
+    onDiscoverServices: () -> Unit,
+    onReadCharacteristic: (DiagnosticReadTarget) -> Unit,
     onRequestMtu: () -> Unit,
 ) {
     val displayedMtu = if (connectionState == ConnectionState.CONNECTED) {
@@ -189,8 +203,21 @@ fun ConnectionScreen(
         Text("Connection details", style = MaterialTheme.typography.titleLarge)
         Text("Selected: ${selectedDevice?.name ?: "No device selected"}")
         selectedDevice?.let { Text(it.address, fontFamily = FontFamily.Monospace) }
-        Text("State: $connectionState")
+        Text("Device RSSI: ${selectedDevice?.rssi?.let { "$it dBm" } ?: "N/A"}")
+        Text("Bluetooth adapter: $adapterState")
+        Text("BLE connection: $connectionState")
+        Text("Bonding: $bondingState")
         Text("Connected device: ${connectedDevice?.name ?: "None"}")
+        Text("Connection started: ${connectionStartedAtMillis?.let(::formatTimestamp) ?: "N/A"}")
+        Text("Connection duration: ${formatDuration(connectionDurationMillis)}")
+        Text("Disconnected: ${disconnectedAtMillis?.let(::formatTimestamp) ?: "N/A"}")
+        Text("Disconnect status: ${disconnectStatus ?: "N/A"}")
+        Text("Service discovery: $serviceDiscoveryState")
+        Text(
+            "Services: ${snapshot.services.size} total, " +
+                "${snapshot.services.count(::isStandardService)} standard, " +
+                "${snapshot.services.count { !isStandardService(it) }} custom",
+        )
         Text("Negotiated MTU: $displayedMtu")
         Text("Maximum characteristic write payload: ${(displayedMtu - 3).coerceAtLeast(0)} bytes (no writes are sent)")
         mtuRequestState.requestedMtu?.let { requested ->
@@ -205,6 +232,7 @@ fun ConnectionScreen(
             )
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(onClick = onScan) { Text("Scan") }
             Button(
                 onClick = onConnect,
                 enabled = selectedDevice != null && connectionState == ConnectionState.DISCONNECTED,
@@ -217,25 +245,61 @@ fun ConnectionScreen(
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
-                onClick = onReadDiagnostics,
+                onClick = onDiscoverServices,
                 enabled = connectionState == ConnectionState.CONNECTED &&
-                    snapshot.discovered && !isReadingDiagnostics,
+                    serviceDiscoveryState != ServiceDiscoveryState.DISCOVERING,
             ) {
-                Text(if (isReadingDiagnostics) "Reading…" else "Read diagnostic values")
+                Text(if (serviceDiscoveryState == ServiceDiscoveryState.DISCOVERING) "Discovering…" else "Discover services")
             }
             OutlinedButton(
                 onClick = onRequestMtu,
                 enabled = connectionState == ConnectionState.CONNECTED &&
-                    !(mtuRequestState.requestAccepted == true && mtuRequestState.callbackStatus == null),
+                    serviceDiscoveryState == ServiceDiscoveryState.COMPLETE &&
+                    operationState.currentOperation == null && operationState.pendingQueueSize == 0,
             ) {
                 Text("Request MTU 247")
             }
         }
+        Text("Current GATT operation: ${operationState.currentOperation ?: "Idle"}")
+        Text("Pending queue: ${operationState.pendingQueueSize}")
+        Text("Last successful operation: ${operationState.lastSuccessfulOperation ?: "N/A"}")
+        Text("Last failed operation: ${operationState.lastFailedOperation ?: "N/A"}")
+        Text("Last GATT error code: ${operationState.lastErrorCode ?: "N/A"}")
         Spacer(Modifier.height(8.dp))
-        if (snapshot.services.isEmpty()) {
-            Text("GATT services appear here after connection and discovery.")
-        }
+        val queueIdle = operationState.currentOperation == null &&
+            operationState.pendingQueueSize == 0 && !isReadingDiagnostics
+        val readyForRead = connectionState == ConnectionState.CONNECTED &&
+            serviceDiscoveryState == ServiceDiscoveryState.COMPLETE && queueIdle
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            item {
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text("Read-only diagnostic tests", style = MaterialTheme.typography.titleMedium)
+                        Text("No reads start automatically. Test 3 requires successful service discovery and MTU negotiation.")
+                        Button(
+                            onClick = { onReadCharacteristic(HondaProtocolReference.MANUFACTURER_NAME_READ_TARGET) },
+                            enabled = readyForRead && mtuRequestState.callbackStatus == 0 &&
+                                !manufacturerReadCompleted,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(if (manufacturerReadCompleted) "Manufacturer Name test completed" else "Read Manufacturer Name (2A29)")
+                        }
+                        Text("Vehicle Information reads are enabled only after the Manufacturer Name test completes.")
+                        HondaProtocolReference.vehicleInformationReadTargets.forEach { target ->
+                            OutlinedButton(
+                                onClick = { onReadCharacteristic(target) },
+                                enabled = readyForRead && manufacturerReadCompleted,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text("Read ${target.label} (${target.characteristicUuid.take(8)}…)")
+                            }
+                        }
+                    }
+                }
+            }
+            if (snapshot.services.isEmpty()) {
+                item { Text("GATT services appear here after explicit service discovery.") }
+            }
             items(snapshot.services, key = { it.uuid }) { service ->
                 Card(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(12.dp)) {
@@ -264,14 +328,18 @@ fun ConnectionScreen(
                 Card(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(12.dp)) {
                         Text(
-                            HondaProtocolReference.diagnosticReadTargets.firstOrNull {
+                            (HondaProtocolReference.vehicleInformationReadTargets +
+                                HondaProtocolReference.MANUFACTURER_NAME_READ_TARGET).firstOrNull {
                                 it.serviceUuid.equals(result.serviceUuid, ignoreCase = true) &&
                                     it.characteristicUuid.equals(result.characteristicUuid, ignoreCase = true)
                             }?.label ?: result.characteristicUuid,
                             style = MaterialTheme.typography.titleSmall,
                         )
                         Text("${result.serviceUuid} / ${result.characteristicUuid}", fontFamily = FontFamily.Monospace)
-                        Text("Read at ${formatTimestamp(result.timestampMillis)}; status ${result.statusCode ?: "N/A"}")
+                        Text("Read started ${formatTimestamp(result.startedAtMillis)}")
+                        Text("Read completed ${formatTimestamp(result.completedAtMillis)}")
+                        Text("Properties: ${propertyNames(result.properties)}")
+                        Text("GATT status ${result.statusCode ?: "N/A"}")
                         if (result.value != null) {
                             Text("Hex: ${formatHex(result.value)}", fontFamily = FontFamily.Monospace)
                             Text("Decoded: ${decodeCharacteristicValue(result.serviceUuid, result.characteristicUuid, result.value)}")
@@ -539,4 +607,10 @@ private fun characteristicPropertySet(characteristic: GattCharacteristicInfo): S
         .toSet()
 
 private fun formatTimestamp(timestampMillis: Long): String =
-    SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault()).format(Date(timestampMillis))
+    SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", Locale.getDefault()).format(Date(timestampMillis))
+
+private fun formatDuration(millis: Long): String =
+    "${millis / 1000}.${(millis % 1000).toString().padStart(3, '0')} s"
+
+private fun isStandardService(service: com.roadsyncplus.ble.GattServiceInfo): Boolean =
+    service.uuid.startsWith("0000") && service.uuid.endsWith("-0000-1000-8000-00805F9B34FB")

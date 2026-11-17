@@ -44,9 +44,11 @@ data class DiagnosticEvent(
 )
 
 data class CharacteristicReadResult(
-    val timestampMillis: Long,
+    val startedAtMillis: Long,
+    val completedAtMillis: Long,
     val serviceUuid: String,
     val characteristicUuid: String,
+    val properties: Int,
     val value: List<Int>?,
     val statusCode: Int?,
     val error: String? = null,
@@ -61,6 +63,14 @@ data class MtuRequestState(
     val callbackAtMillis: Long? = null,
 )
 
+data class GattOperationState(
+    val currentOperation: String? = null,
+    val pendingQueueSize: Int = 0,
+    val lastSuccessfulOperation: String? = null,
+    val lastFailedOperation: String? = null,
+    val lastErrorCode: Int? = null,
+)
+
 data class DiagnosticReadTarget(
     val serviceUuid: String,
     val characteristicUuid: String,
@@ -73,6 +83,19 @@ enum class ConnectionState {
     CONNECTING,
     CONNECTED,
     DISCONNECTING,
+}
+
+enum class ServiceDiscoveryState {
+    NOT_STARTED,
+    DISCOVERING,
+    COMPLETE,
+    FAILED,
+}
+
+enum class BondingState {
+    NONE,
+    BONDING,
+    BONDED,
 }
 
 object HondaProtocolReference {
@@ -100,22 +123,17 @@ object HondaProtocolReference {
     const val DEVICE_INFORMATION_SERVICE = "0000180A-0000-1000-8000-00805F9B34FB"
     const val BATTERY_SERVICE = "0000180F-0000-1000-8000-00805F9B34FB"
 
-    val diagnosticReadTargets = listOf(
+    val vehicleInformationReadTargets = listOf(
         DiagnosticReadTarget(VEHICLE_INFO_SERVICE, VEHICLE_TYPE, "Vehicle type", "01"),
         DiagnosticReadTarget(VEHICLE_INFO_SERVICE, DISPLAY_CAPABILITY, "Display capability", "07"),
         DiagnosticReadTarget(VEHICLE_INFO_SERVICE, SWITCH_TYPE, "Switch type", "00"),
         DiagnosticReadTarget(VEHICLE_INFO_SERVICE, CATEGORY_ID, "Category ID", "01"),
         DiagnosticReadTarget(VEHICLE_INFO_SERVICE, SERIES_CODE, "Series code", "AE 05"),
         DiagnosticReadTarget(VEHICLE_INFO_SERVICE, DESTINATION_ID, "Destination ID", "00"),
-        DiagnosticReadTarget(SECURITY_SERVICE, SECURITY_STATUS, "Security status"),
-        DiagnosticReadTarget(DEVICE_INFORMATION_SERVICE, "00002A29-0000-1000-8000-00805F9B34FB", "Manufacturer name"),
-        DiagnosticReadTarget(DEVICE_INFORMATION_SERVICE, "00002A24-0000-1000-8000-00805F9B34FB", "Model number"),
-        DiagnosticReadTarget(DEVICE_INFORMATION_SERVICE, "00002A25-0000-1000-8000-00805F9B34FB", "Serial number"),
-        DiagnosticReadTarget(DEVICE_INFORMATION_SERVICE, "00002A27-0000-1000-8000-00805F9B34FB", "Hardware revision"),
-        DiagnosticReadTarget(DEVICE_INFORMATION_SERVICE, "00002A26-0000-1000-8000-00805F9B34FB", "Firmware revision"),
-        DiagnosticReadTarget(DEVICE_INFORMATION_SERVICE, "00002A28-0000-1000-8000-00805F9B34FB", "Software revision"),
-        DiagnosticReadTarget(DEVICE_INFORMATION_SERVICE, "00002A23-0000-1000-8000-00805F9B34FB", "System ID"),
-        DiagnosticReadTarget(DEVICE_INFORMATION_SERVICE, "00002A50-0000-1000-8000-00805F9B34FB", "PnP ID"),
-        DiagnosticReadTarget(BATTERY_SERVICE, "00002A19-0000-1000-8000-00805F9B34FB", "Battery level"),
+    )
+    val MANUFACTURER_NAME_READ_TARGET = DiagnosticReadTarget(
+        DEVICE_INFORMATION_SERVICE,
+        "00002A29-0000-1000-8000-00805F9B34FB",
+        "Manufacturer name",
     )
 }

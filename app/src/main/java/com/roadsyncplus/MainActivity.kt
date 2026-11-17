@@ -78,6 +78,15 @@ private fun RoadSyncApp(
     val gattSnapshot by repository.gattSnapshot.collectAsStateWithLifecycle()
     val mtu by repository.mtu.collectAsStateWithLifecycle()
     val mtuRequestState by repository.mtuRequestState.collectAsStateWithLifecycle()
+    val serviceDiscoveryState by repository.serviceDiscoveryState.collectAsStateWithLifecycle()
+    val operationState by repository.operationState.collectAsStateWithLifecycle()
+    val adapterState by repository.adapterState.collectAsStateWithLifecycle()
+    val bondingState by repository.bondingState.collectAsStateWithLifecycle()
+    val connectionStartedAtMillis by repository.connectionStartedAtMillis.collectAsStateWithLifecycle()
+    val disconnectedAtMillis by repository.disconnectedAtMillis.collectAsStateWithLifecycle()
+    val disconnectStatus by repository.disconnectStatus.collectAsStateWithLifecycle()
+    val connectionDurationMillis by repository.connectionDurationMillis.collectAsStateWithLifecycle()
+    val manufacturerReadCompleted by repository.manufacturerReadCompleted.collectAsStateWithLifecycle()
     val events by repository.events.collectAsStateWithLifecycle()
     val enabledNotifications by repository.enabledNotifications.collectAsStateWithLifecycle()
     val characteristicReadResults by repository.characteristicReadResults.collectAsStateWithLifecycle()
@@ -144,11 +153,22 @@ private fun RoadSyncApp(
                 snapshot = gattSnapshot,
                 mtu = mtu,
                 mtuRequestState = mtuRequestState,
+                serviceDiscoveryState = serviceDiscoveryState,
+                operationState = operationState,
+                adapterState = adapterState,
+                bondingState = bondingState,
+                connectionStartedAtMillis = connectionStartedAtMillis,
+                disconnectedAtMillis = disconnectedAtMillis,
+                disconnectStatus = disconnectStatus,
+                connectionDurationMillis = connectionDurationMillis,
                 readResults = characteristicReadResults,
                 isReadingDiagnostics = isReadingDiagnostics,
-                onConnect = { selectedDevice?.let(repository::connect) },
+                manufacturerReadCompleted = manufacturerReadCompleted,
+                onScan = requestScan,
+                onConnect = { (selectedDevice ?: connectedDevice)?.let(repository::connect) },
                 onDisconnect = repository::disconnect,
-                onReadDiagnostics = repository::readDiagnosticCharacteristics,
+                onDiscoverServices = repository::discoverServices,
+                onReadCharacteristic = repository::readCharacteristic,
                 onRequestMtu = repository::requestMtu,
             )
         },

@@ -13,12 +13,13 @@ RoadSync Plus is an Android BLE research prototype for inspecting the Honda PCX1
 ## Features
 
 - Honda BTU scan filter, with an option to show every discovered BLE device.
-- Connect/disconnect and complete service, characteristic, and descriptor discovery.
-- Connection-state, MTU, characteristic-property, and timestamped notification monitoring.
+- Manual connect/disconnect and service discovery, with independent connection, discovery, bonding, and adapter states.
+- Callback-serialized GATT operations (service discovery, MTU negotiation, characteristic reads, and CCCD notification configuration) with a 20-second timeout.
+- Connection duration, disconnect status, RSSI, operation queue state, and timestamped Bluetooth events.
 - Individual notification payload copying.
 - Export as a plain-text report through Android's document picker.
 - Protocol Explorer compares documented UUIDs plus the six Vehicle Information characteristic UUIDs observed in the supplied PCX160 report. ScooterLink abbreviates those UUIDs and its documented values remain PCX125 references.
-- Connection Details can explicitly read the Vehicle Information values, Security.Status, readable Device Information characteristics, and Battery Level, and can explicitly request MTU 247.
+- Connection Details offers one Manufacturer Name read after discovery and successful MTU negotiation, then enables individual Vehicle Information reads only after that test completes. No reads run automatically.
 
 ## Build
 
@@ -34,13 +35,13 @@ Grant Nearby Devices permissions when prompted. On Android versions before 12, l
 
 1. Turn on the motorcycle and open Device Scanner.
 2. Scan for `HONDA BTU` or enable **Show all BLE devices**.
-3. Select a device and connect. Discovery is automatic.
-4. Inspect the discovered GATT tree and Protocol Explorer comparisons.
-5. In Connection Details, tap **Read diagnostic values** to read the supported values sequentially, or explicitly tap **Request MTU 247**.
-6. In Notification Monitor, explicitly enable notifications only for characteristics advertising Notify or Indicate.
+3. Select a device, connect, and explicitly tap **Discover services**. For the connection-stability test, leave reads and MTU negotiation untouched while monitoring the connection state after the pairing screen closes.
+4. For the MTU test, request MTU 247 after discovery and wait for its callback.
+5. For read tests, first read Manufacturer Name (2A29); after that test completes, read the six Vehicle Information characteristics one at a time.
+6. In Notification Monitor, subscriptions remain explicit and are serialized with other GATT operations.
 7. Export a report from the top-bar action.
 
-The app does not automatically pair, authenticate, modify registrations, or send application data. Characteristic reads and MTU negotiation occur only after a user action. The app does not send characteristic writes; notification toggles write only the standard CCCD descriptor. Whether Android displays a system pairing prompt depends on the peripheral and Android platform behavior; the app itself does not initiate pairing.
+The app does not automatically pair, authenticate, modify registrations, or send application data. Characteristic reads and MTU negotiation occur only after a user action. The app does not send characteristic writes; notification toggles write only the standard CCCD descriptor. Whether Android displays a system pairing prompt depends on the peripheral and Android platform behavior; the app itself does not initiate pairing. Pairing-mode timeout and GATT disconnection are tracked separately.
 
 ## Protocol reference
 

@@ -58,7 +58,7 @@ fun decodeCharacteristicValue(
     }
 
     if (service == HondaProtocolReference.VEHICLE_INFO_SERVICE) {
-        val label = HondaProtocolReference.diagnosticReadTargets
+        val label = HondaProtocolReference.vehicleInformationReadTargets
             .firstOrNull { it.characteristicUuid == characteristic }
             ?.label
         if (label != null) {
